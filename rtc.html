@@ -1,0 +1,298 @@
+<!doctype html>
+
+<title>RTC test</title>
+
+    <video id="localVideo" autoplay muted></video>
+    <video id="remoteVideo" autoplay></video>
+
+<div>
+      
+    <div id="start"><button id="startButton" onclick="start();">Start receiving calls</button></div>
+      <button id="peerButton">Peers</button>
+      <div id="call"></div>
+      <button id="hangupButton">Hang Up</button>
+    </div>
+
+<script src="adapter.js"></script>
+<script src="bignumber.min.js"></script>
+<script src="crypto-js.js"></script>
+<script src="sha3.js"></script>
+<script src="elliptic.min.js"></script>
+<script src="web3.min.js"></script>
+<script src="lib/jquery-1.7.min.js"></script>
+<script src="ethereumjs-accounts.js"></script>
+<script src="hooked-web3-provider.js"></script>
+<script src="ipfsapi.js"></script>
+<script src="message.js"></script>
+
+<script>
+
+    var accounts = new Accounts({minPassphraseLength: 6});
+    
+    var aname = window.location.hash.substr(1) || "localAccount";
+     
+    var my_account = localStorage.getItem(aname);
+    if (!my_account) {
+        my_account = accounts.new("foobar").address;
+        localStorage.setItem(aname, my_account);
+        console.log("Generated new account " + my_account);
+    }
+    var accountObject = accounts.get(my_account, "foobar");
+    
+    /*
+    web3.providers.HttpProvider.prototype.prepareRequest = function (async) {
+        var request = new XMLHttpRequest();
+        request.open('POST', this.host, async);
+        // request.withCredentials = true;
+        // request.setRequestHeader('Content-Type','application/json');
+        return request;
+    };
+    */
+    
+    var provider = new HookedWeb3Provider({
+        host: "http://programming-progress.com:8545/",
+        transaction_signer: accounts
+    });
+    web3.setProvider(provider);
+
+    function trace(str) {
+        console.log(str);
+    }
+    
+    var servers = {
+        iceServers: [ {url: "stun:stun.l.google.com:19302"} ]
+    };
+    
+    var peerButton = document.getElementById('peerButton');
+    peerButton.disabled = true;
+    peerButton.onclick = findPeers;
+    
+    var hangupButton = document.getElementById('hangupButton');
+    hangupButton.disabled = true;
+    hangupButton.onclick = hangup;
+
+    var startTime;
+    var localVideo = document.getElementById('localVideo');
+    var remoteVideo = document.getElementById('remoteVideo');
+
+    localVideo.addEventListener('loadedmetadata', function() {
+        trace('Local video videoWidth: ' + this.videoWidth +
+              'px,  videoHeight: ' + this.videoHeight + 'px');
+    });
+
+    remoteVideo.addEventListener('loadedmetadata', function() {
+        trace('Remote video videoWidth: ' + this.videoWidth +
+              'px,  videoHeight: ' + this.videoHeight + 'px');
+    });
+    
+    function findPeers() {
+        var str = "";
+        var lst = eth_msg.getPeers();
+        lst.forEach(addr => str += '<button>Call ' + addr + '</button>');
+        $("#call").html(str);
+        $("#call button").each((i,el) => el.onclick = _ => call(lst[i]));
+    }
+
+    remoteVideo.onresize = function() {
+        trace('Remote video size changed to ' +
+              remoteVideo.videoWidth + 'x' + remoteVideo.videoHeight);
+        // We'll use the first onsize callback as an indication that video has started
+        // playing out.
+        if (startTime) {
+            var elapsedTime = window.performance.now() - startTime;
+            trace('Setup time: ' + elapsedTime.toFixed(3) + 'ms');
+            startTime = null;
+        }
+    };
+
+    var localStream;
+    var pc;
+    var offerOptions = {
+        offerToReceiveAudio: 1,
+        offerToReceiveVideo: 1
+    };
+
+    function gotStream(stream) {
+        trace('Received local stream');
+        localVideo.srcObject = stream;
+        localStream = stream;
+        peerButton.disabled = false;
+    }
+
+    function start() {
+        trace('Requesting local stream ' + my_account);
+        eth_msg.init(my_account);
+        $("#start").hide();
+        navigator.mediaDevices.getUserMedia({
+            audio: true,
+            video: true
+        })
+        .then(gotStream)
+        .catch(function(e) {
+            alert('getUserMedia() error: ' + e.name);
+        });
+    }
+
+    var remote_addr = null;
+
+    function call(addr) {
+        remote_addr = addr;
+        peerButton.disabled = true;
+        $("#call").hide();
+        hangupButton.disabled = false;
+        trace('Starting call');
+        startTime = window.performance.now();
+        var videoTracks = localStream.getVideoTracks();
+        var audioTracks = localStream.getAudioTracks();
+        if (videoTracks.length > 0) {
+            trace('Using video device: ' + videoTracks[0].label);
+        }
+        if (audioTracks.length > 0) {
+            trace('Using audio device: ' + audioTracks[0].label);
+        }
+        pc = new RTCPeerConnection(servers);
+        trace('Created local peer connection object pc1');
+        pc.onicecandidate = function(e) {
+            onIceCandidate(pc, e);
+        };
+        pc.oniceconnectionstatechange = function(e) {
+            onIceStateChange(pc, e);
+        };
+
+        pc.addStream(localStream);
+        trace('Added local stream to pc1');
+
+        pc.onaddstream = gotRemoteStream;
+        /*
+        */
+
+        trace('pc1 createOffer start');
+        pc.createOffer(onCreateOfferSuccess, onCreateSessionDescriptionError, offerOptions);
+    }
+
+    function onCreateSessionDescriptionError(error) {
+        trace('Failed to create session description: ' + error.toString());
+    }
+
+    function onCreateOfferSuccess(desc) {
+        trace('Offer from pc1\n' + desc.sdp);
+        trace('pc1 setLocalDescription start');
+        pc.setLocalDescription(desc, function() {
+            onSetLocalSuccess(pc);
+        }, onSetSessionDescriptionError);
+        eth_msg.sendIPFS(remote_addr, JSON.stringify({sdp:desc}));
+    }
+
+    function onSetLocalSuccess(pc) {
+        trace(' setLocalDescription complete');
+    }
+
+    function onSetRemoteSuccess(pc) {
+        trace(' setRemoteDescription complete');
+    }
+
+    function onSetSessionDescriptionError(error) {
+        trace('Failed to set session description: ' + error.toString());
+    }
+
+    function gotRemoteStream(e) {
+        remoteVideo.srcObject = e.stream;
+        trace('pc2 received remote stream');
+    }
+
+    function onCreateAnswerSuccess(desc) {
+        trace('Answer from pc2:\n' + desc.sdp);
+        trace('pc2 setLocalDescription start');
+        pc.setLocalDescription(desc, function() {
+            onSetLocalSuccess(pc);
+        }, onSetSessionDescriptionError);
+        eth_msg.sendIPFS(remote_addr, JSON.stringify({answer:desc}));
+    }
+    
+    eth_msg.onmessage = (msg, from) => {
+        remote_addr = from;
+        var obj = JSON.parse(msg);
+        if (!pc) {
+            pc = new RTCPeerConnection(servers);
+            trace('Created remote peer connection object pc2');
+            pc.onicecandidate = function(e) {
+                onIceCandidate(pc, e);
+            };
+            pc.oniceconnectionstatechange = function(e) {
+                onIceStateChange(pc, e);
+            };
+            pc.onaddstream = gotRemoteStream;
+            pc.addStream(localStream);
+            trace('Added local stream to pc2');
+        }
+        if (obj.ice) {
+            console.log("Ice candidate " + JSON.stringify(obj.ice));
+            pc.addIceCandidate(new RTCIceCandidate(obj.ice),
+                               function() {onAddIceCandidateSuccess(pc);},
+                               function(err) {onAddIceCandidateError(pc, err);});
+        }
+        if (obj.ice_list) {
+            console.log("Ice candidate " + JSON.stringify(obj.ice_list));
+            obj.ice_list.forEach(ice => pc.addIceCandidate(new RTCIceCandidate(ice),
+                               function() {onAddIceCandidateSuccess(pc);},
+                               function(err) {onAddIceCandidateError(pc, err);}));
+        }
+        if (obj.sdp) {
+            trace('pc2 setRemoteDescription start');
+
+            pc.setRemoteDescription(new RTCSessionDescription(obj.sdp), function() {
+                onSetRemoteSuccess(pc);
+            }, onSetSessionDescriptionError);
+            trace('pc2 createAnswer start');
+            // Since the 'remote' side has no media stream we need
+            // to pass in the right constraints in order for it to
+            // accept the incoming offer of audio and video.
+            pc.createAnswer(onCreateAnswerSuccess, onCreateSessionDescriptionError);
+        }
+        if (obj.answer) {
+            trace('pc1 setRemoteDescription start');
+            pc.setRemoteDescription(new RTCSessionDescription(obj.answer), function() {
+                onSetRemoteSuccess(pc);
+            }, onSetSessionDescriptionError);
+        }
+    }
+
+    var ice_list = [];
+    
+    function onIceCandidate(pc, event) {
+        if (event.candidate) {
+            ice_list.push(event.candidate);
+            // eth_msg.send(remote_addr, JSON.stringify({ice:event.candidate}));
+            trace(' ICE candidate: \n' + JSON.stringify(event.candidate));
+        }
+        else {
+            eth_msg.sendIPFS(remote_addr, JSON.stringify({ice_list:ice_list.slice(0,10)}));
+            console.log("Got all candidates");
+        }
+    }
+
+    function onAddIceCandidateSuccess(pc) {
+        trace(' addIceCandidate success');
+    }
+
+    function onAddIceCandidateError(pc, error) {
+        trace(' failed to add ICE Candidate: ' + error.toString());
+    }
+
+    function onIceStateChange(pc, event) {
+        if (pc) {
+            trace(' ICE state: ' + pc.iceConnectionState);
+            console.log('ICE state change event: ', event);
+        }
+    }
+
+    function hangup() {
+        trace('Ending call');
+        pc.close();
+        pc = null;
+        hangupButton.disabled = true;
+        peerButton.disabled = false;
+    }    
+
+</script>
+
